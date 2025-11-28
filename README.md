@@ -1,1 +1,1 @@
-# ducenral
+DUCENTRAL
