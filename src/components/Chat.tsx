@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { supabase, ChatRoom, ChatMessage } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import { MessageCircle, Send, Users } from 'lucide-react';
@@ -7,15 +7,24 @@ interface ExtendedChatMessage extends ChatMessage {
   sender_name?: string;
 }
 
+interface TypingUser {
+  user_id: string;
+  name: string;
+}
+
 export function Chat() {
-  const { user, session } = useAuth();
+  const { user, profile } = useAuth();
   const [rooms, setRooms] = useState<ChatRoom[]>([]);
   const [selectedRoom, setSelectedRoom] = useState<string | null>(null);
   const [messages, setMessages] = useState<ExtendedChatMessage[]>([]);
   const [newMessage, setNewMessage] = useState('');
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
+  const [typingUsers, setTypingUsers] = useState<Map<string, TypingUser>>(new Map());
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const typingTimeoutRef = useRef<NodeJS.Timeout>();
+  const channelRef = useRef<any>(null);
+  const typingChannelRef = useRef<any>(null);
 
   useEffect(() => {
     fetchRooms();
@@ -23,9 +32,21 @@ export function Chat() {
 
   useEffect(() => {
     if (selectedRoom) {
+      setMessages([]);
+      setTypingUsers(new Map());
       fetchMessages(selectedRoom);
       subscribeToMessages(selectedRoom);
+      subscribeToTyping(selectedRoom);
     }
+
+    return () => {
+      if (channelRef.current) {
+        supabase.removeChannel(channelRef.current);
+      }
+      if (typingChannelRef.current) {
+        supabase.removeChannel(typingChannelRef.current);
+      }
+    };
   }, [selectedRoom]);
 
   useEffect(() => {
@@ -53,23 +74,31 @@ export function Chat() {
   };
 
   const fetchMessages = async (roomId: string) => {
-    if (!session?.access_token) return;
-
     try {
-      const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-      const response = await fetch(
-        `${supabaseUrl}/functions/v1/chat-messages?room_id=${roomId}&limit=100`,
-        {
-          headers: {
-            Authorization: `Bearer ${session.access_token}`,
-            'Content-Type': 'application/json',
-          },
-        }
-      );
+      const { data, error } = await supabase
+        .from('chat_messages')
+        .select(`
+          id,
+          room_id,
+          user_id,
+          message,
+          created_at,
+          profiles (name)
+        `)
+        .eq('room_id', roomId)
+        .order('created_at', { ascending: true })
+        .limit(100);
 
-      if (response.ok) {
-        const data = await response.json();
-        setMessages(data);
+      if (!error && data) {
+        const formattedMessages: ExtendedChatMessage[] = data.map((msg: any) => ({
+          id: msg.id,
+          room_id: msg.room_id,
+          user_id: msg.user_id,
+          message: msg.message,
+          created_at: msg.created_at,
+          sender_name: msg.profiles?.name || 'Unknown',
+        }));
+        setMessages(formattedMessages);
       }
     } catch (error) {
       console.error('Error fetching messages:', error);
@@ -77,8 +106,13 @@ export function Chat() {
   };
 
   const subscribeToMessages = (roomId: string) => {
-    const channel = supabase
-      .channel(`room:${roomId}`)
+    channelRef.current = supabase
+      .channel(`room:${roomId}`, {
+        config: {
+          broadcast: { self: true },
+          presence: { key: user?.id },
+        },
+      })
       .on(
         'postgres_changes',
         {
@@ -88,7 +122,7 @@ export function Chat() {
           filter: `room_id=eq.${roomId}`,
         },
         async (payload) => {
-          const { data: profile } = await supabase
+          const { data: profileData } = await supabase
             .from('profiles')
             .select('name')
             .eq('id', payload.new.user_id)
@@ -100,18 +134,78 @@ export function Chat() {
             user_id: payload.new.user_id,
             message: payload.new.message,
             created_at: payload.new.created_at,
-            sender_name: profile?.name || 'Unknown',
+            sender_name: profileData?.name || 'Unknown',
           };
 
-          setMessages((prev) => [...prev, newMsg]);
-          scrollToBottom();
+          setMessages((prev) => {
+            const exists = prev.some((m) => m.id === newMsg.id);
+            return exists ? prev : [...prev, newMsg];
+          });
+
+          setTypingUsers((prev) => {
+            const updated = new Map(prev);
+            updated.delete(payload.new.user_id);
+            return updated;
+          });
         }
       )
       .subscribe();
+  };
 
-    return () => {
-      supabase.removeChannel(channel);
-    };
+  const subscribeToTyping = (roomId: string) => {
+    typingChannelRef.current = supabase.channel(`typing:${roomId}`);
+
+    typingChannelRef.current
+      .on('broadcast', { event: 'user_typing' }, (payload) => {
+        if (payload.payload.user_id !== user?.id) {
+          setTypingUsers((prev) => {
+            const updated = new Map(prev);
+            updated.set(payload.payload.user_id, {
+              user_id: payload.payload.user_id,
+              name: payload.payload.name,
+            });
+            return updated;
+          });
+
+          setTimeout(() => {
+            setTypingUsers((prev) => {
+              const updated = new Map(prev);
+              updated.delete(payload.payload.user_id);
+              return updated;
+            });
+          }, 3000);
+        }
+      })
+      .subscribe();
+  };
+
+  const broadcastTyping = useCallback(async () => {
+    if (!selectedRoom || !user || !profile) return;
+
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current);
+    }
+
+    typingChannelRef.current?.send({
+      type: 'broadcast',
+      event: 'user_typing',
+      payload: {
+        user_id: user.id,
+        name: profile.name,
+        room_id: selectedRoom,
+      },
+    });
+
+    typingTimeoutRef.current = setTimeout(() => {
+      typingTimeoutRef.current = undefined;
+    }, 3000);
+  }, [selectedRoom, user, profile]);
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setNewMessage(e.target.value);
+    if (e.target.value.trim()) {
+      broadcastTyping();
+    }
   };
 
   const sendMessage = async (e: React.FormEvent) => {
@@ -248,12 +342,20 @@ export function Chat() {
                   <div ref={messagesEndRef} />
                 </div>
 
-                <form onSubmit={sendMessage} className="p-4 border-t border-gray-200 bg-white">
-                  <div className="flex space-x-2">
+                <div className="border-t border-gray-200 bg-white p-4">
+                  {typingUsers.size > 0 && (
+                    <div className="mb-3 text-xs text-gray-500 italic">
+                      {Array.from(typingUsers.values())
+                        .map((u) => u.name)
+                        .join(', ')}{' '}
+                      {typingUsers.size === 1 ? 'is' : 'are'} typing...
+                    </div>
+                  )}
+                  <form onSubmit={sendMessage} className="flex space-x-2">
                     <input
                       type="text"
                       value={newMessage}
-                      onChange={(e) => setNewMessage(e.target.value)}
+                      onChange={handleInputChange}
                       placeholder="Type a message..."
                       disabled={sending}
                       className="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50"
@@ -269,8 +371,8 @@ export function Chat() {
                         <Send className="w-5 h-5" />
                       )}
                     </button>
-                  </div>
-                </form>
+                  </form>
+                </div>
               </>
             ) : (
               <div className="flex-1 flex items-center justify-center">
