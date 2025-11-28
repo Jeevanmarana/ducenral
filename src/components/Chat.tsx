@@ -210,11 +210,23 @@ export function Chat() {
 
   const sendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newMessage.trim() || !selectedRoom || !user) return;
+    if (!newMessage.trim() || !selectedRoom || !user || !profile) return;
 
     const messageText = newMessage.trim();
-    setSending(true);
+    const tempId = `temp-${Date.now()}`;
+
+    const optimisticMessage: ExtendedChatMessage = {
+      id: tempId,
+      room_id: selectedRoom,
+      user_id: user.id,
+      message: messageText,
+      created_at: new Date().toISOString(),
+      sender_name: profile.name,
+    };
+
+    setMessages((prev) => [...prev, optimisticMessage]);
     setNewMessage('');
+    setSending(true);
 
     try {
       const { error } = await supabase
@@ -227,10 +239,12 @@ export function Chat() {
 
       if (error) {
         console.error('Error sending message:', error);
+        setMessages((prev) => prev.filter((m) => m.id !== tempId));
         setNewMessage(messageText);
       }
     } catch (error) {
       console.error('Unexpected error:', error);
+      setMessages((prev) => prev.filter((m) => m.id !== tempId));
       setNewMessage(messageText);
     } finally {
       setSending(false);
@@ -304,42 +318,47 @@ export function Chat() {
                       </p>
                     </div>
                   ) : (
-                    messages.map((message) => {
-                      const isOwn = message.user_id === user?.id;
-                      return (
-                        <div
-                          key={message.id}
-                          className={`flex ${isOwn ? 'justify-end' : 'justify-start'}`}
-                        >
+                    <>
+                      {messages.map((message) => {
+                        const isOwn = message.user_id === user?.id;
+                        const isTempMessage = message.id.startsWith('temp-');
+                        return (
                           <div
-                            className={`max-w-xs lg:max-w-md ${
-                              isOwn
-                                ? 'bg-blue-600 text-white'
-                                : 'bg-white text-gray-900 border border-gray-200'
-                            } rounded-2xl px-4 py-2 shadow-sm`}
+                            key={message.id}
+                            className={`flex ${isOwn ? 'justify-end' : 'justify-start'} ${
+                              isTempMessage ? 'opacity-60' : 'opacity-100'
+                            }`}
                           >
-                            {!isOwn && message.sender_name && (
-                              <p className="text-xs font-semibold mb-1 text-gray-600">
-                                {message.sender_name}
-                              </p>
-                            )}
-                            <p className="break-words">{message.message}</p>
-                            <p
-                              className={`text-xs mt-1 ${
-                                isOwn ? 'text-blue-200' : 'text-gray-500'
-                              }`}
+                            <div
+                              className={`max-w-xs lg:max-w-md ${
+                                isOwn
+                                  ? 'bg-blue-600 text-white'
+                                  : 'bg-white text-gray-900 border border-gray-200'
+                              } rounded-2xl px-4 py-2 shadow-sm transition-opacity`}
                             >
-                              {new Date(message.created_at).toLocaleTimeString([], {
-                                hour: '2-digit',
-                                minute: '2-digit',
-                              })}
-                            </p>
+                              {!isOwn && message.sender_name && (
+                                <p className="text-xs font-semibold mb-1 text-gray-600">
+                                  {message.sender_name}
+                                </p>
+                              )}
+                              <p className="break-words">{message.message}</p>
+                              <p
+                                className={`text-xs mt-1 ${
+                                  isOwn ? 'text-blue-200' : 'text-gray-500'
+                                }`}
+                              >
+                                {isTempMessage ? 'Sending...' : new Date(message.created_at).toLocaleTimeString([], {
+                                  hour: '2-digit',
+                                  minute: '2-digit',
+                                })}
+                              </p>
+                            </div>
                           </div>
-                        </div>
-                      );
-                    })
+                        );
+                      })}
+                      <div ref={messagesEndRef} />
+                    </>
                   )}
-                  <div ref={messagesEndRef} />
                 </div>
 
                 <div className="border-t border-gray-200 bg-white p-4">
